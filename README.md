@@ -1,0 +1,1 @@
+The types defined in `backend/types` is for JSON objects that are returned by the website, not objects from or sent to VNDB
