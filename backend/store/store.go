@@ -8,11 +8,13 @@ import (
 	"os"
 	"strings"
 	"time"
+	"vnclub/club"
 	"vnclub/util"
 
 	"github.com/glebarez/sqlite"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 )
 
@@ -23,7 +25,11 @@ func Open(path string) (*Store, error) {
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 
-	db.AutoMigrate(&Room{}, &User{}, &Session{})
+	if err != nil {
+		return nil, err
+	}
+
+	err = db.AutoMigrate(&Room{}, &User{}, &Session{}, &Media{})
 
 	if err != nil {
 		return nil, err
@@ -31,8 +37,96 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
+func (s *Store) UpsertMedia(m club.Media) (*Media, error) {
+	row := Media{
+		Source:      string(m.Source),
+		SourceID:    m.SourceID,
+		Kind:        string(m.Kind),
+		Title:       m.Title,
+		AltTitle:    m.AltTitle,
+		Description: m.Description,
+		CoverURL:    m.CoverURL,
+		ThumbURL:    m.ThumbURL,
+		Year:        m.Year,
+		ReleaseText: m.ReleaseText,
+		Format:      m.Format,
+		UnitCount:   m.UnitCount,
+		UnitLabel:   m.UnitLabel,
+		Length:      m.Length,
+		IsNSFW:      m.IsNSFW,
+		URL:         m.URL,
+		FetchedAt:   m.FetchedAt,
+	}
+
+	err := s.db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "source"}, {Name: "source_id"}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"kind", "title", "alt_title", "description", "cover_url", "thumb_url",
+			"year", "release_text", "format", "unit_count", "unit_label", "length",
+			"is_nsfw", "url", "fetched_at",
+		}),
+	}).Create(&row).Error
+
+	if err != nil {
+		return nil, err
+	}
+
+	if row.ID == 0 {
+		return s.MediaBySource(m.Source, m.SourceID)
+	}
+
+	return &row, nil
+}
+
+func (s *Store) MediaBySource(source club.MediaSource, sourceID string) (*Media, error) {
+	var m Media
+	err := s.db.Where("source = ? AND source_id = ?", string(source), sourceID).First(&m).Error
+	if err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+func (s *Store) MediaByID(id uint) (*Media, error) {
+	var m Media
+	if err := s.db.First(&m, id).Error; err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+func (s *Store) FreshMedia(source club.MediaSource, sourceID string, maxAge time.Duration) (*Media, bool) {
+	m, err := s.MediaBySource(source, sourceID)
+	if err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, false
+		}
+		return nil, false
+	}
+
+	if time.Since(m.FetchedAt) > maxAge {
+		return nil, false
+	}
+
+	return m, true
+}
+
 func (s *Store) CreateRoom(r *Room) error {
 	return s.db.Create(r).Error
+}
+
+func (s *Store) GetRoomByID(id uint) (*Room, error) {
+	var room Room
+	if err := s.db.Preload("Owner").Preload("Media").First(&room, id).Error; err != nil {
+		return nil, err
+	}
+	return &room, nil
+}
+
+func (s *Store) ListRooms(limit int) ([]Room, error) {
+	var rooms []Room
+	err := s.db.Preload("Owner").Preload("Media").Order("created_at desc").Limit(limit).Where("invite_only = false").Find(&rooms).Error
+	return rooms, err
 }
 
 func (s *Store) CreateUser(username, email, password string) (*User, error) {

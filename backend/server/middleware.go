@@ -17,14 +17,14 @@ func (s *Server) RequireAuth() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		token, err := c.Cookie(sessionCookie)
 		if err != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, util.ErrorJSON("not signed in"))
+			c.AbortWithStatusJSON(http.StatusUnauthorized, util.ErrorJSON("Not signed in"))
 			return
 		}
 
 		user, err := s.Store.GetUserBySession(token)
 		if err != nil {
 			s.clearSessionCookie(c)
-			c.AbortWithStatusJSON(http.StatusUnauthorized, util.ErrorJSON("session expired"))
+			c.AbortWithStatusJSON(http.StatusUnauthorized, util.ErrorJSON("Session expired"))
 		}
 
 		c.Set(contextUser, user)

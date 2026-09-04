@@ -4,11 +4,17 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"regexp"
+	"strconv"
+	"vnclub/anilist"
+	"vnclub/club"
 	"vnclub/store"
 	"vnclub/util"
+	"vnclub/vndb"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 func NewServer(dbPath string) *Server {
@@ -19,6 +25,8 @@ func NewServer(dbPath string) *Server {
 
 	return &Server{
 		Store:         st,
+		VNDB:          vndb.NewClient(),
+		AniList:       anilist.NewClient(),
 		SecureCookies: false, // TODO: Debug flag
 	}
 }
@@ -39,10 +47,14 @@ func (s *Server) Router() *gin.Engine {
 		v1.POST("/login", s.HandleLogin)
 		v1.POST("/logout", s.HandleLogout)
 
+		v1.GET("/rooms", s.HandleListRooms)
+		v1.GET("/rooms/:id", s.HandleGetRoom)
+
 		authed := v1.Group("")
 		authed.Use(s.RequireAuth())
 		{
 			authed.GET("/self", s.HandleSelf)
+			authed.POST("/rooms", s.HandleCreateRoom)
 		}
 	}
 
@@ -123,6 +135,123 @@ func (s *Server) HandleSelf(c *gin.Context) {
 	c.JSON(http.StatusOK, util.DataJSON(toUserResponse(CurrentUser(c))))
 }
 
+var vnIDPattern = regexp.MustCompile(`^v[1-9][0-9]*$`)
+
+var formattedMap map[string]string = map[string]string{
+	"vndb":    "VNDB",
+	"anilist": "AniList",
+}
+
+func (s *Server) HandleCreateRoom(c *gin.Context) {
+	var req createRoomRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, util.ErrorJSON("vn_id is required, source must by VNDB or Anilist and room title needs to be 3-256 characters"))
+		return
+	}
+
+	var media club.Media
+	var merr error
+
+	if req.Source == string(club.SourceVNDB) {
+		if !vnIDPattern.MatchString(req.SourceID) {
+			c.JSON(http.StatusBadRequest, util.ErrorJSON("Invalid format for source_id (VNDB)"))
+			return
+		}
+		media, merr = s.VNDB.MediaByID(req.SourceID)
+	} else {
+		if vnIDPattern.MatchString(req.SourceID) {
+			c.JSON(http.StatusBadRequest, util.ErrorJSON("Invalid format for source_id (AniList)"))
+		}
+		media, merr = s.AniList.MediaByID(req.SourceID)
+	}
+
+	switch {
+	case errors.Is(merr, vndb.ErrNotFound), errors.Is(merr, anilist.ErrNotFound):
+		c.JSON(http.StatusNotFound, util.ErrorJSON("Could not find a media entry with that ID from "+formattedMap[req.Source]))
+		return
+	case errors.Is(merr, vndb.ErrRateLimit), errors.Is(merr, anilist.ErrRateLimit):
+		c.JSON(http.StatusServiceUnavailable, util.ErrorJSON("Rate limit reached. Please try again shortly"))
+		return
+	case merr != nil:
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not fetch media entry from "+formattedMap[req.Source]))
+		return
+	}
+
+	owner := CurrentUser(c)
+
+	mediaRow, err := s.Store.UpsertMedia(media)
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not create the room"))
+		return
+	}
+
+	room := &store.Room{
+		Title:      req.Title,
+		OwnerID:    owner.ID,
+		InviteOnly: req.InviteOnly,
+		MediaID:    mediaRow.ID,
+	}
+
+	if err := s.Store.CreateRoom(room); err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not create the room"))
+		return
+	}
+
+	room.Owner = *owner
+	room.Media = *mediaRow
+	c.JSON(http.StatusCreated, util.DataJSON(toRoomResponse(room, 1)))
+}
+
+func (s *Server) HandleGetRoom(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, util.ErrorJSON("Room ID must be a number"))
+		return
+	}
+
+	room, err := s.Store.GetRoomByID(uint(id))
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusNotFound, util.ErrorJSON("No room found with that ID"))
+		return
+	}
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not load room"))
+		return
+	}
+
+	c.JSON(http.StatusOK, util.DataJSON(toRoomResponse(room, 1)))
+}
+
+func (s *Server) HandleListRooms(c *gin.Context) {
+
+	limit := 50
+	if v := c.Query("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 100 {
+			c.JSON(http.StatusBadRequest, util.ErrorJSON("Limit must be between 1 and 100"))
+			return
+		}
+		limit = n
+	}
+
+	rooms, err := s.Store.ListRooms(limit)
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not fetch rooms"))
+		return
+	}
+
+	roomsResp := make([]roomResponse, 0, len(rooms))
+	for _, r := range rooms {
+		roomsResp = append(roomsResp, toRoomResponse(&r, 1))
+	}
+
+	c.JSON(http.StatusOK, util.DataJSON(roomsResp))
+}
+
 func (s *Server) startSession(c *gin.Context, userID uint) error {
 	session, err := s.Store.CreateSession(userID)
 	if err != nil {
@@ -151,4 +280,8 @@ func (s *Server) clearSessionCookie(c *gin.Context) {
 		Secure:   s.SecureCookies,
 		SameSite: http.SameSiteLaxMode,
 	})
+}
+
+func (s *Server) Close() {
+	s.VNDB.Close()
 }
