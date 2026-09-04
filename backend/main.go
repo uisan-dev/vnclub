@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -20,18 +19,13 @@ func main() {
 	godotenv.Load()
 
 	srv := server.NewServer("vnclub.db")
+	defer srv.VNDB.Close()
+	defer srv.AniList.Close()
 
 	httpSrv := &http.Server{
 		Addr:    ":8080",
 		Handler: srv.Router(),
 	}
-
-	out, err := srv.VNDB.MediaByID("v7")
-	defer srv.VNDB.Close()
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Printf("%+v\n", out)
 
 	go func() {
 		log.Println("Listening on port 8080")

@@ -78,7 +78,7 @@ func (ve *vndbEntry) toMedia() club.Media {
 		SourceID:    ve.ID,
 		URL:         "https://vndb.org/" + ve.ID,
 		UnitCount:   0,
-		UnitLabel:   "parts",
+		UnitLabel:   "Checkpoint",
 		FetchedAt:   time.Now(),
 	}
 

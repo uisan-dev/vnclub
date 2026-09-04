@@ -12,7 +12,6 @@ import (
 	"vnclub/util"
 	"vnclub/vndb"
 
-	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -29,36 +28,6 @@ func NewServer(dbPath string) *Server {
 		AniList:       anilist.NewClient(),
 		SecureCookies: false, // TODO: Debug flag
 	}
-}
-
-func (s *Server) Router() *gin.Engine {
-	r := gin.Default()
-
-	corsCfg := cors.DefaultConfig()
-	corsCfg.AllowOrigins = []string{"http://localhost:5173"}
-	corsCfg.AllowMethods = []string{"GET", "POST", "DELETE", "PATCH", "OPTIONS"}
-	r.Use(cors.New(corsCfg))
-
-	r.GET("/health", s.HandleHealth)
-
-	v1 := r.Group("/api/v1")
-	{
-		v1.POST("/register", s.HandleRegister)
-		v1.POST("/login", s.HandleLogin)
-		v1.POST("/logout", s.HandleLogout)
-
-		v1.GET("/rooms", s.HandleListRooms)
-		v1.GET("/rooms/:id", s.HandleGetRoom)
-
-		authed := v1.Group("")
-		authed.Use(s.RequireAuth())
-		{
-			authed.GET("/self", s.HandleSelf)
-			authed.POST("/rooms", s.HandleCreateRoom)
-		}
-	}
-
-	return r
 }
 
 func (s *Server) HandleHealth(c *gin.Context) {
@@ -128,7 +97,7 @@ func (s *Server) HandleLogout(c *gin.Context) {
 		}
 	}
 	s.clearSessionCookie(c)
-	c.JSON(http.StatusOK, util.DataJSON(true))
+	c.JSON(http.StatusOK, util.DataJSON(gin.H{"logged_in": true}))
 }
 
 func (s *Server) HandleSelf(c *gin.Context) {
@@ -161,6 +130,7 @@ func (s *Server) HandleCreateRoom(c *gin.Context) {
 	} else {
 		if vnIDPattern.MatchString(req.SourceID) {
 			c.JSON(http.StatusBadRequest, util.ErrorJSON("Invalid format for source_id (AniList)"))
+			return
 		}
 		media, merr = s.AniList.MediaByID(req.SourceID)
 	}
@@ -186,10 +156,21 @@ func (s *Server) HandleCreateRoom(c *gin.Context) {
 		return
 	}
 
+	var inviteCode string = ""
+
+	if req.InviteOnly {
+		inviteCode, err = generateSecureString(8)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not generate invite code"))
+			return
+		}
+	}
+
 	room := &store.Room{
 		Title:      req.Title,
 		OwnerID:    owner.ID,
 		InviteOnly: req.InviteOnly,
+		InviteCode: inviteCode,
 		MediaID:    mediaRow.ID,
 	}
 
@@ -201,7 +182,21 @@ func (s *Server) HandleCreateRoom(c *gin.Context) {
 
 	room.Owner = *owner
 	room.Media = *mediaRow
-	c.JSON(http.StatusCreated, util.DataJSON(toRoomResponse(room, 1)))
+
+	s.Store.JoinRoom(room.ID, owner.ID, true)
+
+	if mediaRow.UnitCount > 0 {
+		label := mediaRow.UnitLabel
+		if label == "" {
+			label = "Episode"
+		}
+
+		if err := s.Store.GenerateCheckpoints(room.ID, mediaRow.UnitCount, label); err != nil {
+			c.Error(err)
+		}
+	}
+
+	c.JSON(http.StatusCreated, util.DataJSON(toOwnerRoomResponse(room, 1)))
 }
 
 func (s *Server) HandleGetRoom(c *gin.Context) {
@@ -210,6 +205,8 @@ func (s *Server) HandleGetRoom(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, util.ErrorJSON("Room ID must be a number"))
 		return
 	}
+
+	user := CurrentUser(c)
 
 	room, err := s.Store.GetRoomByID(uint(id))
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -222,7 +219,74 @@ func (s *Server) HandleGetRoom(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, util.DataJSON(toRoomResponse(room, 1)))
+	count, err := s.Store.MemberCounts([]uint{room.ID})
+	if err != nil {
+		c.Error(err)
+	}
+
+	if user != nil && user.ID == room.OwnerID {
+		c.JSON(http.StatusOK, util.DataJSON(toOwnerRoomResponse(room, count[room.ID])))
+		return
+	}
+	c.JSON(http.StatusOK, util.DataJSON(toRoomResponse(room, count[room.ID])))
+}
+
+func (s *Server) HandleJoinRoom(c *gin.Context) {
+	room := s.roomFromParam(c)
+	if room == nil {
+		return
+	}
+
+	user := CurrentUser(c)
+
+	if (room.InviteOnly && c.Query("room") != room.InviteCode) || (room.InviteOnly && user.ID != room.OwnerID) {
+		c.JSON(http.StatusForbidden, util.ErrorJSON("This room is invite only"))
+		return
+	}
+
+	if err := s.Store.JoinRoom(room.ID, user.ID, false); err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Unable to add you to the room"))
+		return
+	}
+
+	member, err := s.Store.GetMembership(room.ID, user.ID)
+
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Joined, but could not fetch membership data"))
+		return
+	}
+
+	c.JSON(http.StatusOK, util.DataJSON(toMemberResponse(member)))
+}
+
+func (s *Server) HandleLeaveRoom(c *gin.Context) {
+	room := s.roomFromParam(c)
+	if room == nil {
+		return
+	}
+
+	user := CurrentUser(c)
+
+	if room.OwnerID == user.ID {
+		c.JSON(http.StatusForbidden, util.ErrorJSON("The owner cannot leave their own room without transferring ownership"))
+		return
+	}
+
+	removed, err := s.Store.LeaveRoom(room.ID, user.ID)
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not remove you from the room"))
+		return
+	}
+
+	if !removed {
+		c.JSON(http.StatusNotFound, util.ErrorJSON("You are not a member of this room"))
+		return
+	}
+
+	c.JSON(http.StatusOK, util.DataJSON(gin.H{"left": true}))
 }
 
 func (s *Server) HandleListRooms(c *gin.Context) {
@@ -246,10 +310,133 @@ func (s *Server) HandleListRooms(c *gin.Context) {
 
 	roomsResp := make([]roomResponse, 0, len(rooms))
 	for _, r := range rooms {
-		roomsResp = append(roomsResp, toRoomResponse(&r, 1))
+		roomsResp = append(roomsResp, toRoomWithCountResponse(&r))
 	}
 
 	c.JSON(http.StatusOK, util.DataJSON(roomsResp))
+}
+
+func (s *Server) HandleSetProgress(c *gin.Context) {
+	room := s.roomFromParam(c)
+	if room == nil {
+		return
+	}
+
+	var req setProgressRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, util.ErrorJSON("Position must be a number"))
+		return
+	}
+
+	total, err := s.Store.CountCheckpoints(room.ID)
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not fetch checkpoints"))
+		return
+	}
+
+	if req.Position < 0 || req.Position > total {
+		c.JSON(http.StatusBadRequest, util.ErrorJSON("Position must be positive and assigned to a checkpoint"))
+		return
+	}
+
+	user := CurrentUser(c)
+
+	updated, err := s.Store.SetProgress(room.ID, user.ID, req.Position)
+
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not update progress"))
+		return
+	}
+
+	if !updated {
+		c.JSON(http.StatusForbidden, util.ErrorJSON("Join the room before setting progress"))
+		return
+	}
+
+	member, err := s.Store.GetMembership(room.ID, user.ID)
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Updated, but could not fetch membership data"))
+		return
+	}
+
+	c.JSON(http.StatusOK, util.DataJSON(toMemberResponse(member)))
+}
+
+func (s *Server) HandleListCheckpoints(c *gin.Context) {
+	room := s.roomFromParam(c)
+	if room == nil {
+		return
+	}
+
+	cps, err := s.Store.ListCheckpoints(room.ID)
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not fetch checkpoints"))
+		return
+	}
+
+	resp := make([]checkpointResponse, 0, len(cps))
+	for _, c := range cps {
+		resp = append(resp, toCheckpointResponse(&c))
+	}
+
+	c.JSON(http.StatusOK, util.DataJSON(resp))
+}
+
+func (s *Server) HandleCreateCheckpoint(c *gin.Context) {
+	room := s.roomFromParam(c)
+	if room == nil {
+		return
+	}
+
+	if room.OwnerID != CurrentUser(c).ID {
+		c.JSON(http.StatusForbidden, util.ErrorJSON("Only the room owner can create checkpoints"))
+		return
+	}
+
+	var req createCheckpointRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, util.ErrorJSON("Label is required and should be 1-256 characters"))
+		return
+	}
+
+	cp, err := s.Store.CreateCheckpoint(room.ID, req.Label)
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not create checkpoint"))
+		return
+	}
+
+	c.JSON(http.StatusCreated, util.DataJSON(toCheckpointResponse(cp)))
+}
+
+func (s *Server) HandleDeleteLastCheckpoint(c *gin.Context) {
+	room := s.roomFromParam(c)
+	if room == nil {
+		return
+	}
+
+	if room.OwnerID != CurrentUser(c).ID {
+		c.JSON(http.StatusForbidden, util.ErrorJSON("Only the room owner can delete checkpoints"))
+		return
+	}
+
+	removed, err := s.Store.DeleteLastCheckpoint(room.ID)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("This room has no checkpoints"))
+		return
+	}
+
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not delete checkpoint"))
+		return
+	}
+
+	c.JSON(http.StatusOK, util.DataJSON(gin.H{"deleted": removed}))
 }
 
 func (s *Server) startSession(c *gin.Context, userID uint) error {
@@ -280,6 +467,27 @@ func (s *Server) clearSessionCookie(c *gin.Context) {
 		Secure:   s.SecureCookies,
 		SameSite: http.SameSiteLaxMode,
 	})
+}
+
+func (s *Server) roomFromParam(c *gin.Context) *store.Room {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, util.ErrorJSON("Room ID must be a number"))
+		return nil
+	}
+
+	room, err := s.Store.GetRoomByID(uint(id))
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusNotFound, util.ErrorJSON("No room found with that ID"))
+		return nil
+	}
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not fetch room"))
+		return nil
+	}
+
+	return room
 }
 
 func (s *Server) Close() {

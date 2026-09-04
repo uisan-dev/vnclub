@@ -25,6 +25,7 @@ func (s *Server) RequireAuth() gin.HandlerFunc {
 		if err != nil {
 			s.clearSessionCookie(c)
 			c.AbortWithStatusJSON(http.StatusUnauthorized, util.ErrorJSON("Session expired"))
+			return
 		}
 
 		c.Set(contextUser, user)

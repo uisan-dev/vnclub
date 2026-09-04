@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"strings"
@@ -29,7 +30,7 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 
-	err = db.AutoMigrate(&Room{}, &User{}, &Session{}, &Media{})
+	err = db.AutoMigrate(&Room{}, &User{}, &Session{}, &Media{}, &Checkpoint{}, &RoomMember{})
 
 	if err != nil {
 		return nil, err
@@ -123,10 +124,134 @@ func (s *Store) GetRoomByID(id uint) (*Room, error) {
 	return &room, nil
 }
 
-func (s *Store) ListRooms(limit int) ([]Room, error) {
-	var rooms []Room
-	err := s.db.Preload("Owner").Preload("Media").Order("created_at desc").Limit(limit).Where("invite_only = false").Find(&rooms).Error
+func (s *Store) ListRooms(limit int) ([]RoomWithCount, error) {
+	var rooms []RoomWithCount
+	err := s.db.Model(&Room{}).
+		Select("rooms.*, COUNT(room_members.user_id) AS member_count").
+		Joins("LEFT JOIN room_members ON room_members.room_id = rooms.id").
+		Where("rooms.invite_only = ?", false).
+		Group("rooms.id").
+		Order("rooms.created_at DESC").
+		Limit(limit).
+		Preload("Owner").Preload("Media").
+		Find(&rooms).Error
 	return rooms, err
+}
+
+func (s *Store) JoinRoom(roomID, userID uint, isOwner bool) error {
+	m := RoomMember{RoomID: roomID, UserID: userID, IsOwner: isOwner, JoinedAt: time.Now()}
+	err := s.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&m).Error
+	return err
+}
+
+func (s *Store) LeaveRoom(roomID, userID uint) (bool, error) {
+	res := s.db.Where("room_id = ? AND user_id = ?", roomID, userID).Delete(&RoomMember{})
+	return res.RowsAffected > 0, res.Error
+}
+
+func (s *Store) Members(roomID uint) ([]RoomMember, error) {
+	var members []RoomMember
+	err := s.db.Preload("User").Where("room_id = ?", roomID).Order("progress desc, joined_at asc").Find(&members).Error
+	return members, err
+}
+
+func (s *Store) MemberCounts(roomIDs []uint) (map[uint]int, error) {
+	counts := make(map[uint]int, len(roomIDs))
+	if len(roomIDs) == 0 {
+		return counts, nil
+	}
+
+	type countRow struct {
+		RoomID uint
+		Total  int
+	}
+
+	var rows []countRow
+	err := s.db.Model(&RoomMember{}).Select("room_id, COUNT(user_id) AS total").Where("room_id IN ?", roomIDs).Group("room_id").Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+
+	for _, r := range rows {
+		counts[r.RoomID] = r.Total
+	}
+	return counts, nil
+}
+
+func (s *Store) GetMembership(roomID, userID uint) (*RoomMember, error) {
+	var m RoomMember
+	err := s.db.Preload("User").Where("room_id = ? AND user_id = ?", roomID, userID).First(&m).Error
+	if err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+func (s *Store) SetProgress(roomID, userID uint, position int) (bool, error) {
+	res := s.db.Model(&RoomMember{}).Where("room_id = ? AND user_id = ?", roomID, userID).Update("progress", position)
+	return res.RowsAffected > 0, res.Error
+}
+
+func (s *Store) GenerateCheckpoints(roomID uint, count int, label string) error {
+	if count <= 0 {
+		return nil
+	}
+
+	cps := make([]Checkpoint, 0, count)
+	for i := 1; i <= count; i++ {
+		cps = append(cps, Checkpoint{
+			RoomID:   roomID,
+			Position: i,
+			Label:    fmt.Sprintf("%s %d", label, i),
+		})
+	}
+	return s.db.CreateInBatches(cps, 256).Error
+}
+
+func (s *Store) CreateCheckpoint(roomID uint, label string) (*Checkpoint, error) {
+	var maxPos int
+	err := s.db.Model(&Checkpoint{}).Where("room_id = ?", roomID).Select("COALESCE(MAX(position), 0)").Scan(&maxPos).Error
+	if err != nil {
+		return nil, err
+	}
+
+	cp := Checkpoint{
+		RoomID:   roomID,
+		Position: maxPos + 1,
+		Label:    label,
+	}
+	if err := s.db.Create(&cp).Error; err != nil {
+		return nil, err
+	}
+	return &cp, err
+}
+
+func (s *Store) ListCheckpoints(roomID uint) ([]Checkpoint, error) {
+	var cps []Checkpoint
+	err := s.db.Where("room_id = ?", roomID).Order("position asc").Find(&cps).Error
+	return cps, err
+}
+
+func (s *Store) CountCheckpoints(roomID uint) (int, error) {
+	var n int64
+	err := s.db.Model(&Checkpoint{}).Where("room_id = ?", roomID).Count(&n).Error
+	return int(n), err
+}
+
+func (s *Store) DeleteLastCheckpoint(roomID uint) (bool, error) {
+	var cp Checkpoint
+	err := s.db.Where("room_id = ?", roomID).Order("position desc").First(&cp).Error
+	if err != nil {
+		return false, err
+	}
+
+	if err := s.db.Delete(&cp).Error; err != nil {
+		return false, err
+	}
+
+	err = s.db.Model(&RoomMember{}).Where("room_id = ? AND progress >= ?", roomID, cp.Position).Update("progress", cp.Position-1).Error
+
+	return true, err
 }
 
 func (s *Store) CreateUser(username, email, password string) (*User, error) {
@@ -164,9 +289,9 @@ func (s *Store) Authenticate(username, password string) (*User, error) {
 
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		waste_hash := os.Getenv("WASTE_HASH")
-		if len(waste_hash) > 0 {
+		if len(waste_hash) == 0 {
 			log.Printf("WASTE_HASH not found in .env file, using default")
-			waste_hash = "c1a00067ee481027f92e6655fc071b9976efaca59f0a0d610c9c25a689d2a656"
+			waste_hash = "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
 		}
 		bcrypt.CompareHashAndPassword([]byte(waste_hash), []byte(password))
 		return nil, ErrInvalidCredentials
@@ -226,7 +351,7 @@ func (s *Store) GetUserBySession(token string) (*User, error) {
 }
 
 func (s *Store) DeleteSession(token string) error {
-	return s.db.Where("token = ?", token).Error
+	return s.db.Where("token = ?", token).Delete(&Session{}).Error
 }
 
 func (s *Store) PurgeExpiredSessions() (int64, error) {

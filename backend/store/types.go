@@ -62,6 +62,9 @@ func (m *Media) ToClub() club.Media {
 		IsNSFW: m.IsNSFW,
 		URL:    m.URL,
 
+		UnitCount: m.UnitCount,
+		UnitLabel: m.UnitLabel,
+
 		FetchedAt: m.FetchedAt,
 	}
 }
@@ -74,8 +77,14 @@ type Room struct {
 	MediaID    uint   `gorm:"index;not null"`
 	Media      Media  `gorm:"foreignKey:MediaID"`
 	InviteOnly bool
+	InviteCode string
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
+}
+
+type RoomWithCount struct {
+	Room
+	MemberCount int
 }
 
 type User struct {
@@ -92,4 +101,25 @@ type Session struct {
 	UserID    uint      `gorm:"index;not null"`
 	ExpiresAt time.Time `gorm:"index;not null"`
 	CreatedAt time.Time
+}
+
+type Checkpoint struct {
+	ID        uint   `gorm:"primaryKey"`
+	RoomID    uint   `gorm:"uniqueIndex:idx_room_position;not null"`
+	Position  int    `gorm:"uniqueIndex:idx_room_position;not null"`
+	Label     string `gorm:"not null"`
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+type RoomMember struct {
+	RoomID   uint `gorm:"primaryKey;autoIncrement:false"`
+	UserID   uint `gorm:"primaryKey;autoIncrement:false"`
+	User     User `gorm:"foreignKey:UserID"`
+	Room     Room `gorm:"foreignKey:RoomID"`
+	Progress int  `gorm:"not null;default:0"`
+
+	IsOwner   bool `gorm:"not null;default:0"`
+	JoinedAt  time.Time
+	UpdatedAt time.Time
 }

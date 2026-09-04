@@ -72,6 +72,7 @@ type roomResponse struct {
 	OwnerName   string        `json:"owner_name"`
 	MemberCount int           `json:"member_count"`
 	InviteOnly  bool          `json:"invite_only"`
+	InviteCode  string        `json:"invite_code,omitempty"`
 	CreatedAt   time.Time     `json:"created_at"`
 }
 
@@ -107,4 +108,65 @@ func toRoomResponse(r *store.Room, members int) roomResponse {
 		InviteOnly:  r.InviteOnly,
 		CreatedAt:   r.CreatedAt,
 	}
+}
+
+func toOwnerRoomResponse(r *store.Room, members int) roomResponse {
+	return roomResponse{
+		ID:          r.ID,
+		Title:       r.Title,
+		Media:       toMediaResponse(&r.Media),
+		OwnerName:   r.Owner.Username,
+		MemberCount: members,
+		InviteOnly:  r.InviteOnly,
+		InviteCode:  r.InviteCode,
+		CreatedAt:   r.CreatedAt,
+	}
+}
+
+func toRoomWithCountResponse(r *store.RoomWithCount) roomResponse {
+	return roomResponse{
+		ID:          r.ID,
+		Title:       r.Title,
+		Media:       toMediaResponse(&r.Media),
+		OwnerName:   r.Owner.Username,
+		MemberCount: r.MemberCount,
+		InviteOnly:  r.InviteOnly,
+		CreatedAt:   r.CreatedAt,
+	}
+}
+
+type memberResponse struct {
+	UserID   uint      `json:"user_id"`
+	Username string    `json:"username"`
+	Progress int       `json:"progress"`
+	IsOwner  bool      `json:"is_owner"`
+	JoinedAt time.Time `json:"joined_at"`
+}
+
+type checkpointResponse struct {
+	ID       uint   `json:"id"`
+	Position int    `json:"position"`
+	Label    string `json:"label"`
+}
+
+type setProgressRequest struct {
+	Position int `json:"position" binding:"min=0"`
+}
+
+type createCheckpointRequest struct {
+	Label string `json:"label" binding:"required,min=1,max=256"`
+}
+
+func toMemberResponse(m *store.RoomMember) memberResponse {
+	return memberResponse{
+		UserID:   m.UserID,
+		Username: m.User.Username,
+		Progress: m.Progress,
+		IsOwner:  m.IsOwner,
+		JoinedAt: m.JoinedAt,
+	}
+}
+
+func toCheckpointResponse(c *store.Checkpoint) checkpointResponse {
+	return checkpointResponse{ID: c.ID, Position: c.Position, Label: c.Label}
 }

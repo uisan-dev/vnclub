@@ -68,7 +68,7 @@ func (am *apiMedia) toClub() club.Media {
 		Source:    club.SourceAniList,
 		SourceID:  strconv.Itoa(am.ID),
 		Kind:      club.KindAnime,
-		UnitLabel: "episodes",
+		UnitLabel: "Episode",
 		IsNSFW:    am.IsAdult,
 		FetchedAt: time.Now(),
 	}
