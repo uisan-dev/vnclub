@@ -238,6 +238,20 @@ func (s *Server) HandleGetRoom(c *gin.Context) {
 		return
 	}
 
+	if room.InviteOnly && c.Query("invite") != room.InviteCode {
+		if user == nil {
+			c.JSON(http.StatusNotFound, util.ErrorJSON("No room found with that ID"))
+			return
+		}
+
+		if user.ID != room.OwnerID {
+			if _, err := s.Store.GetMembership(room.ID, user.ID); err != nil {
+				c.JSON(http.StatusNotFound, util.ErrorJSON("No room found with that ID"))
+				return
+			}
+		}
+	}
+
 	count, err := s.Store.MemberCounts([]uint{room.ID})
 	if err != nil {
 		c.Error(err)
@@ -247,6 +261,7 @@ func (s *Server) HandleGetRoom(c *gin.Context) {
 		c.JSON(http.StatusOK, util.DataJSON(toOwnerRoomResponse(room, count[room.ID])))
 		return
 	}
+
 	c.JSON(http.StatusOK, util.DataJSON(toRoomResponse(room, count[room.ID])))
 }
 
@@ -258,7 +273,14 @@ func (s *Server) HandleJoinRoom(c *gin.Context) {
 
 	user := CurrentUser(c)
 
-	if (room.InviteOnly && c.Query("room") != room.InviteCode) || (room.InviteOnly && user.ID != room.OwnerID) {
+	member, _ := s.Store.GetMembership(room.ID, user.ID)
+
+	if member != nil {
+		c.JSON(http.StatusConflict, util.ErrorJSON("You are already a member of this room"))
+		return
+	}
+
+	if room.InviteOnly && c.Query("invite") != room.InviteCode && user.ID != room.OwnerID {
 		c.JSON(http.StatusForbidden, util.ErrorJSON("This room is invite only"))
 		return
 	}
