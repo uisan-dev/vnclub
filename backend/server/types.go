@@ -145,23 +145,25 @@ type memberResponse struct {
 
 type checkpointResponse struct {
 	ID       uint   `json:"id"`
+	TrackID  uint   `json:"track_id"`
 	Position int    `json:"position"`
 	Label    string `json:"label"`
-}
-
-type setProgressRequest struct {
-	Position int `json:"position" binding:"min=0"`
 }
 
 type createCheckpointRequest struct {
 	Label string `json:"label" binding:"required,min=1,max=256"`
 }
 
+// Position is not "required": the validator reads that as "not the zero
+// value", and 0 legitimately means "not started".
+type setProgressRequest struct {
+	Position int `json:"position" binding:"min=0"`
+}
+
 func toMemberResponse(m *store.RoomMember) memberResponse {
 	return memberResponse{
 		UserID:   m.UserID,
 		Username: m.User.Username,
-		Progress: m.Progress,
 		IsOwner:  m.IsOwner,
 		JoinedAt: m.JoinedAt,
 	}
@@ -169,4 +171,104 @@ func toMemberResponse(m *store.RoomMember) memberResponse {
 
 func toCheckpointResponse(c *store.Checkpoint) checkpointResponse {
 	return checkpointResponse{ID: c.ID, Position: c.Position, Label: c.Label}
+}
+
+type commentResponse struct {
+	ID         uint      `json:"id"`
+	TrackID    uint      `json:"track_id"`
+	TrackLabel string    `json:"track_label"`
+	UserID     uint      `json:"user_id"`
+	Username   string    `json:"username"`
+	Position   int       `json:"position"`
+	Body       string    `json:"body"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+type hiddenTrackCount struct {
+	TrackID uint `json:"track_id"`
+	Hidden  int  `json:"hidden"`
+}
+
+type commentListResponse struct {
+	Comments     []commentResponse  `json:"comments"`
+	Hidden       int                `json:"hidden"`
+	HiddenTracks []hiddenTrackCount `json:"hidden_by_track"`
+}
+
+type createCommentRequest struct {
+	TrackID  uint   `json:"track_id" binding:"required"`
+	Position int    `json:"position" binding:"min=0"`
+	Body     string `json:"body" binding:"required,min=1,max=4000"`
+}
+
+func toCommentResponse(c *store.Comment) commentResponse {
+	return commentResponse{
+		ID:         c.ID,
+		TrackID:    c.TrackID,
+		TrackLabel: c.Track.Label,
+		UserID:     c.UserID,
+		Username:   c.User.Username,
+		Position:   c.Position,
+		Body:       c.Body,
+		CreatedAt:  c.CreatedAt,
+		UpdatedAt:  c.UpdatedAt,
+	}
+}
+
+// trackNodeResponse is flat on purpose. Nesting it server-side would
+// force the client to walk the tree to update one node; a flat list with
+// parent_id is trivial to index, and building the tree in JS is a
+// three-line reduce.
+type trackNodeResponse struct {
+	ID          uint   `json:"id"`
+	ParentID    uint   `json:"parent_id"`
+	BranchAt    int    `json:"branch_at"`
+	Depth       int    `json:"depth"`
+	Slug        string `json:"slug"`
+	Label       string `json:"label"`
+	Sort        int    `json:"sort"`
+	Checkpoints int    `json:"checkpoints"`
+	Progress    int    `json:"progress"`
+	Available   bool   `json:"available"`
+
+	// Unstarted is true when a track is open but untouched: exactly the
+	// set the UI should offer as "what next?".
+	Unstarted bool `json:"unstarted"`
+}
+
+type createTrackRequest struct {
+	Label string `json:"label" binding:"required,min=1,max=256"`
+
+	// ParentID omitted or 0 creates a root track.
+	ParentID uint `json:"parent_id"`
+
+	// BranchAt is the position on the parent where this branch opens.
+	// Not "required": 0 is meaningful, it means "from the start".
+	BranchAt int `json:"branch_at" binding:"min=0"`
+}
+
+func toTrackNodeResponse(n *store.TrackNode) trackNodeResponse {
+	return trackNodeResponse{
+		ID:          n.Track.ID,
+		ParentID:    n.Track.ParentID,
+		BranchAt:    n.Track.BranchAt,
+		Depth:       n.Depth,
+		Slug:        n.Track.Slug,
+		Label:       n.Track.Label,
+		Sort:        n.Track.Sort,
+		Checkpoints: n.Checkpoints,
+		Progress:    n.Progress,
+		Available:   n.Available,
+		Unstarted:   n.Available && n.Progress == 0,
+	}
+}
+
+type trackResponse struct {
+	ID          uint   `json:"id"`
+	Slug        string `json:"slug"`
+	Label       string `json:"label"`
+	Sort        int    `json:"sort"`
+	Checkpoints int    `json:"checkpoints"`
+	Progress    int    `json:"progress"`
 }

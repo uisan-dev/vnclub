@@ -22,7 +22,8 @@ func (s *Server) Router() *gin.Engine {
 		v1.POST("/logout", s.HandleLogout)
 
 		v1.GET("/rooms", s.HandleListRooms)
-		v1.GET("/rooms/:id", s.HandleGetRoom) // TODO: Return 404 if it is invite only and the user is not in it
+		v1.GET("/rooms/:id", s.HandleGetRoom)
+		v1.GET("/rooms/:id/tracks", s.HandleListTracks)
 		v1.GET("/rooms/:id/checkpoints", s.HandleListCheckpoints)
 
 		authed := v1.Group("")
@@ -33,9 +34,18 @@ func (s *Server) Router() *gin.Engine {
 
 			authed.POST("/rooms/:id/join", s.HandleJoinRoom)
 			authed.DELETE("/rooms/:id/leave", s.HandleLeaveRoom)
-			authed.PUT("/rooms/:id/progress", s.HandleSetProgress)
-			authed.POST("/rooms/:id/checkpoints", s.HandleCreateCheckpoint)
-			authed.DELETE("/rooms/:id/checkpoints/last", s.HandleDeleteLastCheckpoint)
+
+			authed.POST("/rooms/:id/tracks", s.HandleCreateTrack)
+			authed.DELETE("/rooms/:id/tracks/:trackID", s.HandleDeleteTrack)
+			authed.POST("/rooms/:id/tracks/:trackID/checkpoints", s.HandleCreateCheckpoint)
+			authed.DELETE("/rooms/:id/tracks/:trackID/checkpoints", s.HandleDeleteLastCheckpoint)
+			authed.PUT("/rooms/:id/tracks/:trackID/progress", s.HandleSetProgress)
+
+			authed.GET("/rooms/:id/progress", s.HandleGetProgress)
+
+			authed.GET("/rooms/:id/comments", s.HandleListComments)
+			authed.POST("/rooms/:id/comments", s.HandleCreateComment)
+			authed.DELETE("/rooms/:id/comments/:commentID", s.HandleDeleteComment)
 		}
 	}
 

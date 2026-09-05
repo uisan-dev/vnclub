@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"vnclub/anilist"
 	"vnclub/club"
 	"vnclub/store"
@@ -185,13 +186,31 @@ func (s *Server) HandleCreateRoom(c *gin.Context) {
 
 	s.Store.JoinRoom(room.ID, owner.ID, true)
 
+	label := "Main"
+	if mediaRow.Kind == string(club.KindAnime) {
+		label = "Episodes"
+	}
+
+	track, err := s.Store.CreateTrack(room.ID, label)
+	if err != nil {
+		c.Error(err)
+	} else if mediaRow.UnitCount > 0 {
+		unit := mediaRow.UnitLabel
+		if unit == "" {
+			unit = "Episode"
+		}
+		if err := s.Store.GenerateCheckpoints(room.ID, track.ID, mediaRow.UnitCount, unit); err != nil {
+			c.Error(err)
+		}
+	}
+
 	if mediaRow.UnitCount > 0 {
 		label := mediaRow.UnitLabel
 		if label == "" {
 			label = "Episode"
 		}
 
-		if err := s.Store.GenerateCheckpoints(room.ID, mediaRow.UnitCount, label); err != nil {
+		if err := s.Store.GenerateCheckpoints(room.ID, track.ID, mediaRow.UnitCount, label); err != nil {
 			c.Error(err)
 		}
 	}
@@ -316,53 +335,129 @@ func (s *Server) HandleListRooms(c *gin.Context) {
 	c.JSON(http.StatusOK, util.DataJSON(roomsResp))
 }
 
+func (s *Server) HandleDeleteLastCheckpoint(c *gin.Context) {
+	room := s.roomFromParam(c)
+	if room == nil {
+		return
+	}
+
+	if room.OwnerID != CurrentUser(c).ID {
+		c.JSON(http.StatusForbidden, util.ErrorJSON("Only the room owner can delete checkpoints"))
+		return
+	}
+
+	track := s.trackFromParam(c, room.ID)
+	if track == nil {
+		return
+	}
+
+	removed, err := s.Store.DeleteLastCheckpoint(track.ID)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusNotFound, util.ErrorJSON("This track has no checkpoints"))
+		return
+	}
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not delete the checkpoint"))
+		return
+	}
+
+	c.JSON(http.StatusOK, util.DataJSON(gin.H{"deleted": removed}))
+}
+
 func (s *Server) HandleSetProgress(c *gin.Context) {
 	room := s.roomFromParam(c)
 	if room == nil {
 		return
 	}
 
-	var req setProgressRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, util.ErrorJSON("Position must be a number"))
+	user := CurrentUser(c)
+	if member := s.requireMembership(c, room.ID, user.ID); member == nil {
 		return
 	}
 
-	total, err := s.Store.CountCheckpoints(room.ID)
+	track := s.trackFromParam(c, room.ID)
+	if track == nil {
+		return
+	}
+
+	available, err := s.Store.IsTrackAvailable(room.ID, user.ID, track.ID)
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not check track availability"))
+		return
+	}
+	if !available {
+		c.JSON(http.StatusForbidden, util.ErrorJSON("You haven't unlocked "+track.Label+" yet"))
+		return
+	}
+
+	var req setProgressRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, util.ErrorJSON("Position must be zero or a positive number"))
+		return
+	}
+
+	total, err := s.Store.CountTrackCheckpoints(track.ID)
 	if err != nil {
 		c.Error(err)
 		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not fetch checkpoints"))
 		return
 	}
 
-	if req.Position < 0 || req.Position > total {
-		c.JSON(http.StatusBadRequest, util.ErrorJSON("Position must be positive and assigned to a checkpoint"))
+	// Progress past the last checkpoint would unlock comments that don't
+	// exist yet, so reject rather than silently clamping.
+	if req.Position > total {
+		c.JSON(http.StatusBadRequest, util.ErrorJSON(
+			"This track only has "+strconv.Itoa(total)+" checkpoints"))
 		return
 	}
 
-	user := CurrentUser(c)
-
-	updated, err := s.Store.SetProgress(room.ID, user.ID, req.Position)
-
-	if err != nil {
+	if err := s.Store.SetProgress(room.ID, user.ID, track.ID, req.Position); err != nil {
 		c.Error(err)
 		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not update progress"))
 		return
 	}
 
-	if !updated {
-		c.JSON(http.StatusForbidden, util.ErrorJSON("Join the room before setting progress"))
-		return
-	}
-
-	member, err := s.Store.GetMembership(room.ID, user.ID)
+	nodes, err := s.Store.TrackTree(room.ID, user.ID)
 	if err != nil {
 		c.Error(err)
-		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Updated, but could not fetch membership data"))
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Progress saved, but could not reload tracks"))
 		return
 	}
 
-	c.JSON(http.StatusOK, util.DataJSON(toMemberResponse(member)))
+	resp := make([]trackNodeResponse, 0, len(nodes))
+	for i := range nodes {
+		resp = append(resp, toTrackNodeResponse(&nodes[i]))
+	}
+
+	c.JSON(http.StatusOK, util.DataJSON(resp))
+}
+
+func (s *Server) HandleGetProgress(c *gin.Context) {
+	room := s.roomFromParam(c)
+	if room == nil {
+		return
+	}
+
+	user := CurrentUser(c)
+	if member := s.requireMembership(c, room.ID, user.ID); member == nil {
+		return
+	}
+
+	nodes, err := s.Store.TrackTree(room.ID, user.ID)
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not fetch tracks"))
+		return
+	}
+
+	resp := make([]trackNodeResponse, 0, len(nodes))
+	for i := range nodes {
+		resp = append(resp, toTrackNodeResponse(&nodes[i]))
+	}
+
+	c.JSON(http.StatusOK, util.DataJSON(resp))
 }
 
 func (s *Server) HandleListCheckpoints(c *gin.Context) {
@@ -397,13 +492,18 @@ func (s *Server) HandleCreateCheckpoint(c *gin.Context) {
 		return
 	}
 
+	track := s.trackFromParam(c, room.ID)
+	if track == nil {
+		return
+	}
+
 	var req createCheckpointRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, util.ErrorJSON("Label is required and should be 1-256 characters"))
 		return
 	}
 
-	cp, err := s.Store.CreateCheckpoint(room.ID, req.Label)
+	cp, err := s.Store.CreateCheckpoint(room.ID, track.ID, req.Label)
 	if err != nil {
 		c.Error(err)
 		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not create checkpoint"))
@@ -413,30 +513,283 @@ func (s *Server) HandleCreateCheckpoint(c *gin.Context) {
 	c.JSON(http.StatusCreated, util.DataJSON(toCheckpointResponse(cp)))
 }
 
-func (s *Server) HandleDeleteLastCheckpoint(c *gin.Context) {
+func (s *Server) HandleListComments(c *gin.Context) {
+	room := s.roomFromParam(c)
+	if room == nil {
+		return
+	}
+
+	user := CurrentUser(c)
+	if member := s.requireMembership(c, room.ID, user.ID); member == nil {
+		return
+	}
+
+	var comments []store.Comment
+	var err error
+
+	// ?track=<id> narrows to one route; omitted means everything unlocked.
+	if raw := c.Query("track"); raw != "" {
+		trackID, convErr := strconv.ParseUint(raw, 10, 64)
+		if convErr != nil {
+			c.JSON(http.StatusBadRequest, util.ErrorJSON("Track filter must be a number"))
+			return
+		}
+		comments, err = s.Store.VisibleTrackComments(room.ID, user.ID, uint(trackID))
+	} else {
+		comments, err = s.Store.VisibleComments(room.ID, user.ID)
+	}
+
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not fetch comments"))
+		return
+	}
+
+	hidden, err := s.Store.HiddenCommentCount(room.ID, user.ID)
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not count comments"))
+		return
+	}
+
+	perTrack, err := s.Store.HiddenPerTrack(room.ID, user.ID)
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not count comments"))
+		return
+	}
+
+	resp := commentListResponse{
+		Comments:     make([]commentResponse, 0, len(comments)),
+		Hidden:       hidden,
+		HiddenTracks: make([]hiddenTrackCount, 0, len(perTrack)),
+	}
+	for i := range comments {
+		resp.Comments = append(resp.Comments, toCommentResponse(&comments[i]))
+	}
+	for trackID, n := range perTrack {
+		resp.HiddenTracks = append(resp.HiddenTracks, hiddenTrackCount{TrackID: trackID, Hidden: n})
+	}
+
+	c.JSON(http.StatusOK, util.DataJSON(resp))
+}
+
+func (s *Server) HandleCreateComment(c *gin.Context) {
+	room := s.roomFromParam(c)
+	if room == nil {
+		return
+	}
+
+	user := CurrentUser(c)
+	if member := s.requireMembership(c, room.ID, user.ID); member == nil {
+		return
+	}
+
+	var req createCommentRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, util.ErrorJSON(
+			"track_id is required, body must be 1-4000 characters and position cannot be negative"))
+		return
+	}
+
+	// Resolving the track against the room stops a track id from another
+	// room being used to smuggle a comment in here.
+	track, err := s.Store.GetTrack(room.ID, req.TrackID)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusBadRequest, util.ErrorJSON("No track with that ID in this room"))
+		return
+	}
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not fetch track"))
+		return
+	}
+
+	progress, err := s.Store.MemberTrackProgress(room.ID, user.ID)
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not fetch progress"))
+		return
+	}
+
+	// You cannot write about part of a route you have not reached. This
+	// is per track, so finishing one route grants nothing on another.
+	if req.Position > progress[track.ID] {
+		c.JSON(http.StatusForbidden, util.ErrorJSON(
+			"You cannot comment past your own progress on "+track.Label))
+		return
+	}
+
+	total, err := s.Store.CountTrackCheckpoints(track.ID)
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not fetch checkpoints"))
+		return
+	}
+	if req.Position > total {
+		c.JSON(http.StatusBadRequest, util.ErrorJSON("That checkpoint does not exist on this track"))
+		return
+	}
+
+	comment := &store.Comment{
+		RoomID:   room.ID,
+		TrackID:  track.ID,
+		UserID:   user.ID,
+		Position: req.Position,
+		Body:     strings.TrimSpace(req.Body),
+	}
+
+	if err := s.Store.CreateComment(comment); err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not post the comment"))
+		return
+	}
+
+	// Create does not backfill associations, so without these the
+	// response carries an empty username and track label.
+	comment.User = *user
+	comment.Track = *track
+
+	c.JSON(http.StatusCreated, util.DataJSON(toCommentResponse(comment)))
+}
+
+func (s *Server) HandleDeleteComment(c *gin.Context) {
+	room := s.roomFromParam(c)
+	if room == nil {
+		return
+	}
+
+	commentID, err := strconv.ParseUint(c.Param("commentID"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, util.ErrorJSON("Comment ID must be a number"))
+		return
+	}
+
+	user := CurrentUser(c)
+	if member := s.requireMembership(c, room.ID, user.ID); member == nil {
+		return
+	}
+
+	isOwner := room.OwnerID == user.ID
+
+	deleted, err := s.Store.DeleteComment(uint(commentID), room.ID, user.ID, isOwner)
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not delete the comment"))
+		return
+	}
+
+	// A comment belonging to someone else and one that does not exist
+	// both land here on purpose, so ids can't be enumerated.
+	if !deleted {
+		c.JSON(http.StatusNotFound, util.ErrorJSON("No comment of yours with that ID in this room"))
+		return
+	}
+
+	c.JSON(http.StatusOK, util.DataJSON(gin.H{"deleted": true}))
+}
+
+func (s *Server) HandleListTracks(c *gin.Context) {
+	room := s.roomFromParam(c)
+	if room == nil {
+		return
+	}
+
+	var userID uint
+	if user := CurrentUser(c); user != nil {
+		userID = user.ID
+	}
+
+	nodes, err := s.Store.TrackTree(room.ID, userID)
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not fetch tracks"))
+		return
+	}
+
+	resp := make([]trackNodeResponse, 0, len(nodes))
+	for _, n := range nodes {
+		resp = append(resp, toTrackNodeResponse(&n))
+	}
+
+	c.JSON(http.StatusOK, util.DataJSON(resp))
+}
+
+func (s *Server) HandleCreateTrack(c *gin.Context) {
 	room := s.roomFromParam(c)
 	if room == nil {
 		return
 	}
 
 	if room.OwnerID != CurrentUser(c).ID {
-		c.JSON(http.StatusForbidden, util.ErrorJSON("Only the room owner can delete checkpoints"))
+		c.JSON(http.StatusForbidden, util.ErrorJSON("Only the room owner can add tracks"))
 		return
 	}
 
-	removed, err := s.Store.DeleteLastCheckpoint(room.ID)
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		c.JSON(http.StatusInternalServerError, util.ErrorJSON("This room has no checkpoints"))
+	var req createTrackRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, util.ErrorJSON("Label must be 1-256 characters and branch_at must not be negative"))
 		return
 	}
 
+	track, err := s.Store.CreateBranchingTrack(room.ID, req.ParentID, req.BranchAt, strings.TrimSpace(req.Label))
+
+	switch {
+	case errors.Is(err, store.ErrParentNotFound):
+		c.JSON(http.StatusBadRequest, util.ErrorJSON("No parent track with that ID"))
+		return
+	case errors.Is(err, store.ErrBranchPastParent):
+		c.JSON(http.StatusBadRequest, util.ErrorJSON("The branch point is past the end of the parent track"))
+		return
+	case errors.Is(err, store.ErrTrackExists):
+		c.JSON(http.StatusConflict, util.ErrorJSON("Track already exists"))
+	case err != nil:
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not create track"))
+		return
+	}
+
+	c.JSON(http.StatusCreated, util.DataJSON(trackNodeResponse{
+		ID:       track.ID,
+		ParentID: track.ParentID,
+		BranchAt: track.BranchAt,
+		Slug:     track.Slug,
+		Label:    track.Label,
+		Sort:     track.Sort,
+	}))
+}
+
+func (s *Server) HandleDeleteTrack(c *gin.Context) {
+	room := s.roomFromParam(c)
+	if room == nil {
+		return
+	}
+
+	if room.OwnerID != CurrentUser(c).ID {
+		c.JSON(http.StatusForbidden, util.ErrorJSON("Only the room owner can delete tracks"))
+		return
+	}
+
+	track := s.trackFromParam(c, room.ID)
+	if track == nil {
+		return
+	}
+
+	removed, err := s.Store.DeleteLeafTrack(room.ID, track.ID)
+	if errors.Is(err, store.ErrTrackHasChildren) {
+		c.JSON(http.StatusConflict, util.ErrorJSON("Cannot delete a track without deleting child tracks first"))
+		return
+	}
 	if err != nil {
 		c.Error(err)
-		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not delete checkpoint"))
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not delete track"))
+		return
+	}
+	if !removed {
+		c.JSON(http.StatusNotFound, util.ErrorJSON("No track with that ID in this room"))
 		return
 	}
 
-	c.JSON(http.StatusOK, util.DataJSON(gin.H{"deleted": removed}))
+	c.JSON(http.StatusOK, util.DataJSON(gin.H{"deleted": true}))
 }
 
 func (s *Server) startSession(c *gin.Context, userID uint) error {
@@ -490,6 +843,44 @@ func (s *Server) roomFromParam(c *gin.Context) *store.Room {
 	return room
 }
 
+func (s *Server) trackFromParam(c *gin.Context, roomID uint) *store.Track {
+	id, err := strconv.ParseUint(c.Param("trackID"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, util.ErrorJSON("Track ID must be a number"))
+		return nil
+	}
+
+	track, err := s.Store.GetTrack(roomID, uint(id))
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusNotFound, util.ErrorJSON("No track with that ID in this room"))
+		return nil
+	}
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not fetch track"))
+		return nil
+	}
+	return track
+}
+
+func (s *Server) requireMembershipForComments(c *gin.Context, roomID, userID uint) *store.RoomMember {
+	return s.requireMembership(c, roomID, userID)
+}
+
 func (s *Server) Close() {
 	s.VNDB.Close()
+}
+
+func (s *Server) requireMembership(c *gin.Context, roomID, userID uint) *store.RoomMember {
+	member, err := s.Store.GetMembership(roomID, userID)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusForbidden, util.ErrorJSON("Join the room first"))
+		return nil
+	}
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not fetch membership data"))
+		return nil
+	}
+	return member
 }
