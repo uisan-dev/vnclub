@@ -151,7 +151,7 @@ func (s *Store) LeaveRoom(roomID, userID uint) (bool, error) {
 
 func (s *Store) Members(roomID uint) ([]RoomMember, error) {
 	var members []RoomMember
-	err := s.db.Preload("User").Where("room_id = ?", roomID).Order("progress desc, joined_at asc").Find(&members).Error
+	err := s.db.Preload("User").Where("room_id = ?", roomID).Order("is_owner desc, joined_at asc").Find(&members).Error
 	return members, err
 }
 
@@ -727,6 +727,46 @@ func (s *Store) TrackTree(roomID, userID uint) ([]TrackNode, error) {
 		})
 	}
 	return nodes, nil
+}
+
+// RoomsForUser returns the rooms this user is a member of, with member
+// counts, in one query.
+//
+// Two joins do different jobs: the INNER JOIN on "mine" filters to rooms
+// the user belongs to, and the LEFT JOIN on "everyone" counts all their
+// members. Using one join for both would count only the caller.
+func (s *Store) RoomsForUser(userID uint, limit int) ([]RoomWithCount, error) {
+	var rooms []RoomWithCount
+
+	err := s.db.Model(&Room{}).
+		Select("rooms.*, COUNT(everyone.user_id) AS member_count").
+		Joins("JOIN room_members mine ON mine.room_id = rooms.id AND mine.user_id = ?", userID).
+		Joins("LEFT JOIN room_members everyone ON everyone.room_id = rooms.id").
+		Group("rooms.id").
+		Order("rooms.created_at DESC").
+		Limit(limit).
+		Preload("Owner").Preload("Media").
+		Find(&rooms).Error
+
+	return rooms, err
+}
+
+// RoomsOwnedBy returns rooms this user created, including invite-only
+// ones, which ListRooms deliberately hides.
+func (s *Store) RoomsOwnedBy(userID uint, limit int) ([]RoomWithCount, error) {
+	var rooms []RoomWithCount
+
+	err := s.db.Model(&Room{}).
+		Select("rooms.*, COUNT(room_members.user_id) AS member_count").
+		Joins("LEFT JOIN room_members ON room_members.room_id = rooms.id").
+		Where("rooms.owner_id = ?", userID).
+		Group("rooms.id").
+		Order("rooms.created_at DESC").
+		Limit(limit).
+		Preload("Owner").Preload("Media").
+		Find(&rooms).Error
+
+	return rooms, err
 }
 
 // IsTrackAvailable answers the question for one track, used to reject

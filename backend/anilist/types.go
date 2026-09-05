@@ -29,7 +29,7 @@ type graphQLError struct {
 
 type responseData struct {
 	Media *apiMedia `json:"Media"`
-	Page  *apiPage  `json:"page"`
+	Page  *apiPage  `json:"Page"`
 }
 
 type apiPage struct {

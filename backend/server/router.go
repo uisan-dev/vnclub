@@ -25,11 +25,16 @@ func (s *Server) Router() *gin.Engine {
 		v1.GET("/rooms/:id", s.HandleGetRoom)
 		v1.GET("/rooms/:id/tracks", s.HandleListTracks)
 		v1.GET("/rooms/:id/checkpoints", s.HandleListCheckpoints)
+		v1.GET("/rooms/:id/members", s.HandleListMembers)
 
 		authed := v1.Group("")
 		authed.Use(s.RequireAuth())
 		{
+
+			authed.GET("/search", s.HandleSearch)
+
 			authed.GET("/self", s.HandleSelf)
+			authed.GET("/self/rooms", s.HandleMyRooms)
 			authed.POST("/rooms", s.HandleCreateRoom)
 
 			authed.POST("/rooms/:id/join", s.HandleJoinRoom)

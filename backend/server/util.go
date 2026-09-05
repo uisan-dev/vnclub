@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/rand"
 	"math/big"
+	"strings"
 	"vnclub/store"
 )
 
@@ -25,4 +26,12 @@ func generateSecureString(length int) (string, error) {
 	}
 
 	return string(result), nil
+}
+
+func truncateRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return strings.TrimSpace(string(r[:max])) + "…"
 }

@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 	"vnclub/anilist"
 	"vnclub/club"
 	"vnclub/store"
@@ -119,41 +120,34 @@ func (s *Server) HandleCreateRoom(c *gin.Context) {
 		return
 	}
 
-	var media club.Media
-	var merr error
+	var err error
 
 	if req.Source == string(club.SourceVNDB) {
 		if !vnIDPattern.MatchString(req.SourceID) {
 			c.JSON(http.StatusBadRequest, util.ErrorJSON("Invalid format for source_id (VNDB)"))
 			return
 		}
-		media, merr = s.VNDB.MediaByID(req.SourceID)
 	} else {
 		if vnIDPattern.MatchString(req.SourceID) {
 			c.JSON(http.StatusBadRequest, util.ErrorJSON("Invalid format for source_id (AniList)"))
 			return
 		}
-		media, merr = s.AniList.MediaByID(req.SourceID)
-	}
-
-	switch {
-	case errors.Is(merr, vndb.ErrNotFound), errors.Is(merr, anilist.ErrNotFound):
-		c.JSON(http.StatusNotFound, util.ErrorJSON("Could not find a media entry with that ID from "+formattedMap[req.Source]))
-		return
-	case errors.Is(merr, vndb.ErrRateLimit), errors.Is(merr, anilist.ErrRateLimit):
-		c.JSON(http.StatusServiceUnavailable, util.ErrorJSON("Rate limit reached. Please try again shortly"))
-		return
-	case merr != nil:
-		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not fetch media entry from "+formattedMap[req.Source]))
-		return
 	}
 
 	owner := CurrentUser(c)
 
-	mediaRow, err := s.Store.UpsertMedia(media)
-	if err != nil {
+	mediaRow, err := s.resolveMedia(club.MediaSource(req.Source), req.SourceID)
+
+	switch {
+	case errors.Is(err, vndb.ErrNotFound), errors.Is(err, anilist.ErrNotFound):
+		c.JSON(http.StatusNotFound, util.ErrorJSON("Could not find a media entry with that ID from "+formattedMap[req.Source]))
+		return
+	case errors.Is(err, vndb.ErrRateLimit), errors.Is(err, anilist.ErrRateLimit):
+		c.JSON(http.StatusServiceUnavailable, util.ErrorJSON("Rate limit reached. Please try again shortly"))
+		return
+	case err != nil:
 		c.Error(err)
-		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not create the room"))
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not fetch media entry from "+formattedMap[req.Source]))
 		return
 	}
 
@@ -184,7 +178,9 @@ func (s *Server) HandleCreateRoom(c *gin.Context) {
 	room.Owner = *owner
 	room.Media = *mediaRow
 
-	s.Store.JoinRoom(room.ID, owner.ID, true)
+	if err := s.Store.JoinRoom(room.ID, owner.ID, true); err != nil {
+		c.Error(err)
+	}
 
 	label := "Main"
 	if mediaRow.Kind == string(club.KindAnime) {
@@ -200,17 +196,6 @@ func (s *Server) HandleCreateRoom(c *gin.Context) {
 			unit = "Episode"
 		}
 		if err := s.Store.GenerateCheckpoints(room.ID, track.ID, mediaRow.UnitCount, unit); err != nil {
-			c.Error(err)
-		}
-	}
-
-	if mediaRow.UnitCount > 0 {
-		label := mediaRow.UnitLabel
-		if label == "" {
-			label = "Episode"
-		}
-
-		if err := s.Store.GenerateCheckpoints(room.ID, track.ID, mediaRow.UnitCount, label); err != nil {
 			c.Error(err)
 		}
 	}
@@ -273,10 +258,10 @@ func (s *Server) HandleJoinRoom(c *gin.Context) {
 
 	user := CurrentUser(c)
 
-	member, _ := s.Store.GetMembership(room.ID, user.ID)
+	member, err := s.Store.GetMembership(room.ID, user.ID)
 
-	if member != nil {
-		c.JSON(http.StatusConflict, util.ErrorJSON("You are already a member of this room"))
+	if err == nil {
+		c.JSON(http.StatusOK, util.DataJSON(toMemberResponse(member)))
 		return
 	}
 
@@ -291,7 +276,7 @@ func (s *Server) HandleJoinRoom(c *gin.Context) {
 		return
 	}
 
-	member, err := s.Store.GetMembership(room.ID, user.ID)
+	member, err = s.Store.GetMembership(room.ID, user.ID)
 
 	if err != nil {
 		c.Error(err)
@@ -814,6 +799,158 @@ func (s *Server) HandleDeleteTrack(c *gin.Context) {
 	c.JSON(http.StatusOK, util.DataJSON(gin.H{"deleted": true}))
 }
 
+func (s *Server) HandleSearch(c *gin.Context) {
+	source := club.MediaSource(c.Query("source"))
+	if source != club.SourceVNDB && source != club.SourceAniList {
+		c.JSON(http.StatusBadRequest, util.ErrorJSON("source must be vndb or anilist"))
+		return
+	}
+
+	term := strings.TrimSpace(c.Query("q"))
+	if len(term) < 2 {
+		c.JSON(http.StatusBadRequest, util.ErrorJSON("Search term must be at least 2 characters"))
+		return
+	}
+	if len(term) > 100 {
+		c.JSON(http.StatusBadRequest, util.ErrorJSON("Search term is too long"))
+		return
+	}
+
+	limit := 10
+	if v := c.Query("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 25 {
+			c.JSON(http.StatusBadRequest, util.ErrorJSON("Limit must be between 1 and 25"))
+			return
+		}
+		limit = n
+	}
+
+	var results []club.Media
+	var err error
+
+	switch source {
+	case club.SourceVNDB:
+		results, err = s.VNDB.Search(term, limit)
+	case club.SourceAniList:
+		results, err = s.AniList.Search(term, limit)
+	}
+
+	switch {
+	case errors.Is(err, vndb.ErrRateLimit), errors.Is(err, anilist.ErrRateLimit):
+		c.JSON(http.StatusServiceUnavailable, util.ErrorJSON("Rate limit reached. Please try again shortly"))
+		return
+	case err != nil:
+		c.Error(err)
+		c.JSON(http.StatusBadGateway, util.ErrorJSON("Could not search "+formattedMap[string(source)]))
+		return
+	}
+
+	resp := make([]searchResultResponse, 0, len(results))
+	for _, m := range results {
+		resp = append(resp, toSearchResult(m))
+	}
+
+	c.JSON(http.StatusOK, util.DataJSON(resp))
+}
+
+// --------------------------------------------------------------- my rooms
+
+func (s *Server) HandleMyRooms(c *gin.Context) {
+	user := CurrentUser(c)
+
+	limit := 50
+	if v := c.Query("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 100 {
+			c.JSON(http.StatusBadRequest, util.ErrorJSON("Limit must be between 1 and 100"))
+			return
+		}
+		limit = n
+	}
+
+	rooms, err := s.Store.RoomsForUser(user.ID, limit)
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not fetch your rooms"))
+		return
+	}
+
+	resp := make([]roomResponse, 0, len(rooms))
+	for i := range rooms {
+		// The owner sees their own invite codes here; nobody else does.
+		if rooms[i].OwnerID == user.ID {
+			resp = append(resp, toOwnerRoomResponse(&rooms[i].Room, rooms[i].MemberCount))
+			continue
+		}
+		resp = append(resp, toRoomWithCountResponse(&rooms[i]))
+	}
+
+	c.JSON(http.StatusOK, util.DataJSON(resp))
+}
+
+// HandleListMembers returns everyone in a room with their position on
+// each track, so the UI can show who is where.
+//
+// This does not leak spoilers: a position is a number, and the labels it
+// refers to are already public on the checkpoints endpoint.
+func (s *Server) HandleListMembers(c *gin.Context) {
+	room := s.roomFromParam(c)
+	if room == nil {
+		return
+	}
+
+	// Private rooms only expose their membership to members.
+	if room.InviteOnly {
+		user := CurrentUser(c)
+		if user == nil {
+			c.JSON(http.StatusNotFound, util.ErrorJSON("No room found with that ID"))
+			return
+		}
+		if user.ID != room.OwnerID {
+			if _, err := s.Store.GetMembership(room.ID, user.ID); err != nil {
+				c.JSON(http.StatusNotFound, util.ErrorJSON("No room found with that ID"))
+				return
+			}
+		}
+	}
+
+	members, err := s.Store.Members(room.ID)
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not fetch members"))
+		return
+	}
+
+	// One query for everyone's progress rather than one per member.
+	progress, err := s.Store.AllProgress(room.ID)
+	if err != nil {
+		c.Error(err)
+		c.JSON(http.StatusInternalServerError, util.ErrorJSON("Could not fetch progress"))
+		return
+	}
+
+	resp := make([]memberListResponse, 0, len(members))
+	for i := range members {
+		m := &members[i]
+
+		positions := make([]trackPosition, 0, len(progress[m.UserID]))
+		for trackID, pos := range progress[m.UserID] {
+			positions = append(positions, trackPosition{TrackID: trackID, Position: pos})
+		}
+
+		resp = append(resp, memberListResponse{
+			UserID:   m.UserID,
+			Username: m.User.Username,
+			IsOwner:  m.IsOwner,
+			JoinedAt: m.JoinedAt,
+			Progress: positions,
+		})
+	}
+
+	c.JSON(http.StatusOK, util.DataJSON(resp))
+}
+
 func (s *Server) startSession(c *gin.Context, userID uint) error {
 	session, err := s.Store.CreateSession(userID)
 	if err != nil {
@@ -905,4 +1042,30 @@ func (s *Server) requireMembership(c *gin.Context, roomID, userID uint) *store.R
 		return nil
 	}
 	return member
+}
+
+// resolveMedia returns a stored entry if it was fetched recently, and
+// only goes upstream otherwise. Ten rooms for the same show cost one
+// API call, which matters more for rate limits than any retry logic.
+func (s *Server) resolveMedia(source club.MediaSource, sourceID string) (*store.Media, error) {
+	if m, ok := s.Store.FreshMedia(source, sourceID, 7*24*time.Hour); ok {
+		return m, nil
+	}
+
+	var fetched club.Media
+	var err error
+
+	switch source {
+	case club.SourceVNDB:
+		fetched, err = s.VNDB.MediaByID(sourceID)
+	case club.SourceAniList:
+		fetched, err = s.AniList.MediaByID(sourceID)
+	default:
+		return nil, errors.New("unknown source")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return s.Store.UpsertMedia(fetched)
 }

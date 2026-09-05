@@ -3,6 +3,7 @@ package server
 import (
 	"time"
 	"vnclub/anilist"
+	"vnclub/club"
 	"vnclub/store"
 	"vnclub/vndb"
 )
@@ -271,4 +272,55 @@ type trackResponse struct {
 	Sort        int    `json:"sort"`
 	Checkpoints int    `json:"checkpoints"`
 	Progress    int    `json:"progress"`
+}
+
+type searchResultResponse struct {
+	Source      string `json:"source"`
+	SourceID    string `json:"source_id"`
+	Kind        string `json:"kind"`
+	Title       string `json:"title"`
+	AltTitle    string `json:"alt_title,omitempty"`
+	Description string `json:"description,omitempty"`
+	ThumbURL    string `json:"thumbnail_url,omitempty"`
+	CoverURL    string `json:"cover_url,omitempty"`
+	Year        int    `json:"year,omitempty"`
+	Format      string `json:"format,omitempty"`
+	ReleaseText string `json:"release_text,omitempty"`
+	UnitCount   int    `json:"unit_count"`
+	UnitLabel   string `json:"unit_label,omitempty"`
+	IsNSFW      bool   `json:"is_nsfw"`
+	URL         string `json:"url"`
+}
+
+func toSearchResult(m club.Media) searchResultResponse {
+	return searchResultResponse{
+		Source:      string(m.Source),
+		SourceID:    m.SourceID,
+		Kind:        string(m.Kind),
+		Title:       m.Title,
+		AltTitle:    m.AltTitle,
+		Description: truncateRunes(m.Description, 300),
+		ThumbURL:    m.ThumbURL,
+		CoverURL:    m.CoverURL,
+		Year:        m.Year,
+		Format:      m.Format,
+		ReleaseText: m.ReleaseText,
+		UnitCount:   m.UnitCount,
+		UnitLabel:   m.UnitLabel,
+		IsNSFW:      m.IsNSFW,
+		URL:         m.URL,
+	}
+}
+
+type memberListResponse struct {
+	UserID   uint            `json:"user_id"`
+	Username string          `json:"username"`
+	IsOwner  bool            `json:"is_owner"`
+	JoinedAt time.Time       `json:"joined_at"`
+	Progress []trackPosition `json:"progress"`
+}
+
+type trackPosition struct {
+	TrackID  uint `json:"track_id"`
+	Position int  `json:"position"`
 }
